@@ -1,0 +1,800 @@
+---
+title: ""
+output:   
+  html_document:
+    theme: yeti
+---
+
+data pulled: 2018-07-10  
+date created: 2018-07-20      
+date last edited: 2018-07-22        
+date ran: `r Sys.Date()`
+
+
+```{r datacleaning, include=FALSE, warning = FALSE}
+
+#This script does not include participants currently in progress (defined as incomplete 'termination checklist')
+
+library(reshape)
+library(tidyverse)
+library(ggplot2)
+library(plotly)
+library(plyr)
+library(dplyr)
+library('ggpubr')
+library('Cairo')
+
+#set options
+theme_set(theme_minimal())
+
+#read in csv
+df <- read.csv('SPINS_terminal_2018-07-10.csv', header = FALSE)  #contents of file system
+demo <- read.csv('SPINS_REDCap_2018-07-12.csv', header = TRUE, na.strings=c("","NA")) #demographics export from REDCap
+
+#cut out all bval, bvec, json, and ppm file extensions
+df <- as.data.frame(df[!grepl('.bval', df[[1]]),])
+df <- as.data.frame(df[!grepl('.bvec', df[[1]]),])
+df <- as.data.frame(df[!grepl('.json', df[[1]]),]) 
+df <- as.data.frame(df[!grepl('.ppm', df[[1]]),])
+
+#rename variable
+names(df)[1] <- "scan"
+
+#remove path from string
+df$scan <- substring(df$scan, 30)
+
+#split path into two columns; one with participant ID
+df <- colsplit(df$scan,'/',names=c("subject_id","scan"))
+
+#remove phantoms
+df <- as.data.frame(df[- grep('_PHA_', df$scan),]) #ADNI and FBIRN phantoms
+df <- as.data.frame(df[!grepl('_P00', df$subject_id),]) #human phantoms
+df <- as.data.frame(df[!grepl('999', df$subject_id),]) #test participant
+df <- as.data.frame(df[!grepl('998', df$subject_id),]) #test participant
+
+#cut out the scan ID from the file string
+df$scan <- substring(df$scan, 22)
+
+#bring out scan name
+df$scan_name <- sapply(strsplit(df$scan, '_'), `[`, 1)
+
+#rename DTI
+df$scan_name[df$scan_name == "DTI60-1000"] <- "DTI"
+
+#remove scans we don't need to include these in count
+df <- as.data.frame(df[!grepl('FMAP-', df$scan_name),]) #don't need fmaps
+df <- as.data.frame(df[- grep('^PD$', df$scan_name),]) #don't need whatever is currently called PD - second file?
+
+#remove scan column; no longer needed
+df <- subset(df, select= -scan)
+
+#turn from long to wide format
+df <- df %>%
+  group_by(subject_id, scan_name) %>%
+  dplyr::summarise(count = n()) %>%
+  ungroup() %>%
+  spread(scan_name, count, fill = 0)
+
+#add column for site info
+df$scanner <- substring(df$subject_id, 7, 9)
+
+#recalculate all scan counts (get rid of counting extra scans - which may be error - have made issues to follow up)
+df$DTI <- ifelse(df$DTI >= 1, 1, df$DTI)
+df$EMP <- ifelse(df$EMP >= 3, 3, df$EMP)
+df$FLAIR <- ifelse(df$FLAIR >= 1, 1, df$FLAIR)
+df$IMI <- ifelse(df$IMI >= 1, 1, df$IMI)
+df$OBS <- ifelse(df$OBS >= 1, 1, df$OBS)
+df$PDT2 <- ifelse(df$PDT2 >= 1, 1, df$PDT2)
+df$RST <- ifelse(df$RST >= 1, 1, df$RST)
+df$T2 <- ifelse(df$T2 >= 1, 1, df$T2)
+df$T1 <- ifelse(df$T1 >= 1 & (df$scanner == 'CMH' | df$scanner == 'CMP'), 1, df$T1)
+df$T1 <- ifelse(df$T1 >= 3 & (df$scanner == 'MRC' | df$scanner == 'MRP'), 3, df$T1)
+df$T1 <- ifelse(df$T1 >= 1 & (df$scanner == 'ZHH' | df$scanner == 'ZHP'), 1, df$T1)
+
+#make a site variable
+df$site <- NA
+df$site <- ifelse(df$scanner == 'CMH' | df$scanner == 'CMP', "Toronto", df$site)
+df$site <- ifelse(df$scanner == 'MRC' | df$scanner == 'MRP', "Maryland", df$site)
+df$site <- ifelse(df$scanner == 'ZHH' | df$scanner == 'ZHP', "New York", df$site)
+
+#make revised score for T1
+df$T1_r <- ifelse(df$site == "Maryland" & df$T1 == 3, 1, 0)
+df$T1_r <- ifelse(df$site != "Maryland", df$T1, df$T1_r)
+
+#make revised score for EMP
+df$EMP_r <- ifelse(df$EMP == 3, 1, 0)
+
+#make a variable for completeness
+df$mri_complete_igFLAIR <- ifelse( #ignoring FLAIR in our 'total' count
+    df$DTI == 1 & 
+    df$IMI == 1 &
+    df$OBS == 1 &
+    df$PDT2 == 1 &      
+    df$RST == 1 &     
+    df$T2 == 1 &
+    df$T1_r == 1 &
+    df$EMP_r == 1, 1, 0)   
+
+df$mri_complete_inFLAIR <- ifelse( #including FLAIR in our 'total' count
+    df$DTI == 1 & 
+    df$FLAIR == 1 &
+    df$IMI == 1 &
+    df$OBS == 1 &
+    df$PDT2 == 1 &      
+    df$RST == 1 &     
+    df$T2 == 1 &
+    df$T1_r == 1 &
+    df$EMP_r == 1, 1, 0)   
+
+#review data from REDCap
+demo <- demo[,c(
+  'record_id', 
+  'redcap_event_name', #group
+  'consent_dt', #date of consent
+  'demo_age_study_entry', #age at study entry
+  'demo_sex_birth', #sex
+  'demo_highest_grade_self', #education
+  'subsum_socog_test', #completed scog and ncog
+  'term_premature_yn', #premature withdrawal
+  'term_no_longer_elg', #no longer meet eligibility
+  'term_rdoc')]  #data sharing
+
+#recode variables
+demo$redcap_event_name <- ifelse(demo$redcap_event_name == 'case_arm_2', 'case', 'control') #group
+demo$demo_sex_birth <- ifelse(demo$demo_sex_birth == 1, 'female', 'male') #sex
+demo$subsum_socog_test <- ifelse(demo$subsum_socog_test == 1, 'YES', demo$subsum_socog_test) #scog/ncog
+demo$subsum_socog_test <- ifelse(demo$subsum_socog_test == 0, 'NO', demo$subsum_socog_test) #scog/ncog
+demo$term_premature_yn <- ifelse(demo$term_premature_yn == 0, 'NO', demo$term_premature_yn) #withdrawn?
+demo$term_premature_yn <- ifelse(demo$term_premature_yn == 1, 'YES', demo$term_premature_yn) #withdrawn?
+demo$term_no_longer_elg <- ifelse(is.na(demo$term_no_longer_elg), 'NO', 'YES' ) 
+demo$term_rdoc <- ifelse(demo$term_rdoc == 0, 'NO', 'YES' ) 
+
+#change variable names
+names(demo)[names(demo) == 'redcap_event_name'] <- 'group'
+names(demo)[names(demo) == 'demo_age_study_entry'] <- 'age'
+names(demo)[names(demo) == 'demo_sex_birth'] <- 'sex'
+names(demo)[names(demo) == 'demo_highest_grade_self'] <- 'education'
+names(demo)[names(demo) == 'subsum_socog_test'] <- 'cog_complete'
+names(demo)[names(demo) == 'term_premature_yn'] <- 'terminate'
+names(demo)[names(demo) == 'term_no_longer_elg'] <- 'not_eligible'
+names(demo)[names(demo) == 'term_rdoc'] <- 'datashare'
+
+#remove last 2 characters of participant ID from the file system, so can merge
+df$subject_id <- substring(df$subject_id, 1, 14)
+
+#merge df and demo dataframes
+df <- merge(demo, df, by.x = 'record_id', by.y = 'subject_id', all.x = TRUE) 
+rm(demo)
+
+#remove participants that didn't meet eligibility
+#df<-df[!(df$not_eligible=='YES'),] #32
+
+#remove participants that didn't consent to data sharing OR shouldn't be shared for another reason
+#df<-df[!(df$datashare =='NO'),] #26
+
+#rearrange columns
+df <- df[, c(
+  "record_id",  
+  "group",                
+  "site", 
+  "scanner",              
+  "consent_dt",           
+  "age",                  
+  "sex",                  
+  "education",
+  "T1_r", 
+  "T2",  
+  "PDT2", 
+  "DTI",   
+  "RST", 
+  "IMI",                  
+  "OBS",                  
+  "EMP_r",                  
+  "FLAIR",               
+  "mri_complete_igFLAIR", 
+  "mri_complete_inFLAIR",
+  "cog_complete",        
+  "terminate",
+  'not_eligible', 
+  'datashare'
+)]
+
+#name columns
+names(df)[names(df) == 'T1_r'] <- 'T1'
+names(df)[names(df) == 'EMP_r'] <- 'EA'
+
+#fill in site and scanner info
+df$scanner <- substring(df$record_id, 7, 9)
+df$site <- ifelse(df$scanner == 'CMH' | df$scanner == 'CMP', "Toronto", df$site)
+df$site <- ifelse(df$scanner == 'MRC' | df$scanner == 'MRP', "Maryland", df$site)
+df$site <- ifelse(df$scanner == 'ZHH' | df$scanner == 'ZHP', "New York", df$site)
+
+#remove rows if consent date or sex is NA (either didn't complete first assessment, or not yet entered)
+df <- df[!is.na(df$consent_dt),]
+df <- df[!is.na(df$sex),]
+
+#remove participants currently in progress (ascertained by NA in 'cog_complete' and 'terminate')
+df <- df[!is.na(df$cog_complete),]
+df <- df[!is.na(df$terminate),]
+
+#write csv
+#write.csv(df, 'generated_csvs/SPINS_participantList.csv', row.names=FALSE)
+
+```
+
+```{r imaging_df, include = FALSE, warning = FALSE}
+
+#combine site and scanner information in new variable
+df$scanner_sites <- paste(df$site, df$scanner, sep = " ")
+
+#we are going to exclude FLAIR from counts of complete participants - rename variable
+names(df)[names(df) == 'mri_complete_igFLAIR'] <- 'TOTAL'
+
+#make dataframe of just imaging data we need
+imaging_df <- df[, c(
+  "record_id",
+  "scanner_sites",
+  'group',
+  'sex',
+  'cog_complete',
+  "T1",
+  "T2",
+  "PDT2",
+  "DTI",
+  "RST",
+  "IMI",
+  "OBS",
+  "FLAIR",
+  "TOTAL")]
+
+#melt data to make easier to work with
+  imaging_df <- melt(imaging_df , id.vars = c("record_id", "scanner_sites", 'group', 'sex', 'cog_complete'))
+
+#make sure factor variables are factors
+  imaging_df$scanner_sites <- as.factor(imaging_df$scanner_sites)
+  imaging_df$group <- as.factor(imaging_df$group)
+  imaging_df$sex <- as.factor(imaging_df$sex)
+  imaging_df$cog_complete <- as.factor(imaging_df$cog_complete)
+
+#adjust completion levels for value factor
+   imaging_df$value <- as.factor(imaging_df$value)
+   levels(imaging_df$value) <- c(levels(imaging_df$value), "complete", "incomplete")
+   imaging_df$value[imaging_df$value == "1"]  <- "complete"
+   imaging_df$value[imaging_df$value == "0"]  <- "incomplete"
+   imaging_df$value <- droplevels(imaging_df$value, exclude = c("1", "0"))
+   
+#set up facet plots labels using labeller
+scale_labels = c(
+  "T1" = "T1",
+  "T2" = "T2",
+  "PDT2" = "PDT2",
+  "DTI" = "DTI",
+  "RST" = "RST",
+  "IMI" = "IMI",
+  "OBS" = "OBS",
+  "FLAIR" = "FLAIR", 
+  "TOTAL" = "TOTAL")
+   
+```
+
+```{r plotting_df_site, include = FALSE, warning = FALSE}
+
+###################
+#sites - all (tab 1)
+###################
+
+#aggregate data for plots
+  imaging_df_site1 <- ddply(imaging_df, .var = c("scanner_sites", "variable"), .fun = summarise,
+                  complete = sum(value %in% "complete"),
+                  incomplete = sum(value %in% "incomplete"),
+                  count_complete = sum(complete),
+                  count_total = sum(complete + incomplete))
+
+#melt data for plotting
+  imaging_df_site1 <- melt(imaging_df_site1, id.vars = c("scanner_sites", "variable", 'count_complete', 'count_total'))
+  names(imaging_df_site1)[2] <- "scan"
+
+#set up fill colours for bargraphs
+imaging_df_site1$FillColor <- ordered(paste0(imaging_df_site1$scanner_sites, "_", imaging_df_site1$variable), levels=c(
+   "Toronto CMH_incomplete", "Toronto CMH_complete",
+   "Toronto CMP_incomplete", "Toronto CMP_complete",
+   "Maryland MRC_incomplete", "Maryland MRC_complete",
+   "Maryland MRP_incomplete", "Maryland MRP_complete",
+   "New York ZHH_incomplete", "New York ZHH_complete",
+   "New York ZHP_incomplete", "New York ZHP_complete"))
+
+#set up manual colour scale, with site colours and alpha
+colours_site1 = c(
+  "Toronto CMH_incomplete" = alpha("#6c2e8a", .25),
+  "Toronto CMH_complete" = alpha("#6c2e8a", 1),
+  "Toronto CMP_incomplete" = alpha("#6c2e8a", .25),
+  "Toronto CMP_complete" = alpha("#6c2e8a", 1),
+  
+  "Maryland MRC_incomplete" = alpha("#e01e39", .25),
+  "Maryland MRC_complete" = alpha("#e01e39", 1),
+  "Maryland MRP_incomplete" = alpha("#e01e39", .25),
+  "Maryland MRP_complete" = alpha("#e01e39", 1),
+  
+  "New York ZHH_incomplete" = alpha("#1e4698", .25),
+  "New York ZHH_complete" = alpha("#1e4698", 1),
+  "New York ZHP_incomplete" = alpha("#1e4698", .25),
+  "New York ZHP_complete" = alpha("#1e4698", 1))
+
+imaging_df_site1$scanner_sites <- factor(imaging_df_site1$scanner_sites, levels = c(
+  'Toronto CMH', 
+  'Toronto CMP',
+  'Maryland MRC', 
+  'Maryland MRP',
+  'New York ZHH', 
+  'New York ZHP'))
+
+#make a variable for sites
+imaging_df_site1$site <- str_sub(imaging_df_site1$scanner_sites,-3,-1)
+
+
+###################
+#sites - complete only (tab 2)
+###################
+
+#aggregate data for plots
+  imaging_df_site2 <- ddply(imaging_df, .var = c("scanner_sites", "variable", "cog_complete"), .fun = summarise,
+                  complete = sum(value %in% "complete"),
+                  incomplete = sum(value %in% "incomplete"),
+                  count_complete = sum(complete),
+                  count_total = sum(complete + incomplete))
+
+#remove rows for incomplete cognition
+imaging_df_site2 <- imaging_df_site2[(imaging_df_site2$cog_complete=='YES'), ]
+
+#remove cog_complete column
+imaging_df_site2 <- subset(imaging_df_site2, select = -cog_complete)
+
+#melt data for plotting
+  imaging_df_site2 <- melt(imaging_df_site2, id.vars = c("scanner_sites", "variable", 'count_complete', 'count_total'))
+  names(imaging_df_site2)[2] <- "scan"
+
+#set up fill colours for bargraphs
+imaging_df_site2$FillColor <- ordered(paste0(imaging_df_site2$scanner_sites, "_", imaging_df_site2$variable), levels=c(
+   "Toronto CMH_incomplete", "Toronto CMH_complete",
+   "Toronto CMP_incomplete", "Toronto CMP_complete",
+   "Maryland MRC_incomplete", "Maryland MRC_complete",
+   "Maryland MRP_incomplete", "Maryland MRP_complete",
+   "New York ZHH_incomplete", "New York ZHH_complete",
+   "New York ZHP_incomplete", "New York ZHP_complete"))
+
+#set up manual colour scale, with site colours and alpha
+colours_site2 = c(
+  "Toronto CMH_incomplete" = alpha("#6c2e8a", .25),
+  "Toronto CMH_complete" = alpha("#6c2e8a", 1),
+  "Toronto CMP_incomplete" = alpha("#6c2e8a", .25),
+  "Toronto CMP_complete" = alpha("#6c2e8a", 1),
+  
+  "Maryland MRC_incomplete" = alpha("#e01e39", .25),
+  "Maryland MRC_complete" = alpha("#e01e39", 1),
+  "Maryland MRP_incomplete" = alpha("#e01e39", .25),
+  "Maryland MRP_complete" = alpha("#e01e39", 1),
+  
+  "New York ZHH_incomplete" = alpha("#1e4698", .25),
+  "New York ZHH_complete" = alpha("#1e4698", 1),
+  "New York ZHP_incomplete" = alpha("#1e4698", .25),
+  "New York ZHP_complete" = alpha("#1e4698", 1))
+
+imaging_df_site2$scanner_sites <- factor(imaging_df_site2$scanner_sites, levels = c(
+  'Toronto CMH', 
+  'Toronto CMP',
+  'Maryland MRC', 
+  'Maryland MRP',
+  'New York ZHH', 
+  'New York ZHP'))
+
+#make a variable for sites
+imaging_df_site2$site <- str_sub(imaging_df_site2$scanner_sites,-3,-1)
+   
+```
+
+```{r plotting_df_dx, include = FALSE, warning = FALSE}
+
+###################
+#dx - all (tab 3)
+###################
+
+#remove incomplete scans
+imaging_df_dx1 <- imaging_df[(imaging_df$value=='complete'), ]
+
+#remove sex column
+imaging_df_dx1 <- subset(imaging_df_dx1, select = -sex)
+
+#remove cog_complete column - we want even if not complete
+imaging_df_dx1 <- subset(imaging_df_dx1, select = -cog_complete)
+
+#aggregate data for plots
+imaging_df_dx1 <- ddply(imaging_df_dx1, .var = c("scanner_sites", "variable", 'group'), .fun = summarise,
+                  complete = sum(value %in% "complete"))
+
+#change variable name for consistency
+names(imaging_df_dx1)[2] <- "scan"
+
+#make a variable for sites
+imaging_df_dx1$site <- str_sub(imaging_df_dx1$scanner_sites,-3,-1)
+
+#set up fill colours for bargraphs
+imaging_df_dx1$FillColor <- ordered(paste0(imaging_df_dx1$scanner_sites, "_", imaging_df_dx1$group), levels=c(
+   "Toronto CMH_case", "Toronto CMH_control",
+   "Toronto CMP_case", "Toronto CMP_control",
+   "Maryland MRC_case", "Maryland MRC_control",
+   "Maryland MRP_case", "Maryland MRP_control",
+   "New York ZHH_case", "New York ZHH_control",
+   "New York ZHP_case", "New York ZHP_control"))
+
+#set up manual colour scale, with site colours and alpha
+colours_dx = c(
+  "Toronto CMH_case" = "#d8b70a",
+  "Toronto CMH_control" = "#db8c36",
+  "Toronto CMP_case" = "#d8b70a",
+  "Toronto CMP_control" = "#db8c36",
+  
+  "Maryland MRC_case" = "#d8b70a",
+  "Maryland MRC_control" = "#db8c36",
+  "Maryland MRP_case" = "#d8b70a",
+  "Maryland MRP_control" = "#db8c36",
+  
+  "New York ZHH_case" = "#d8b70a",
+  "New York ZHH_control" = "#db8c36",
+  "New York ZHP_case" = "#d8b70a",
+  "New York ZHP_control" = "#db8c36")
+
+###################
+#dx - complete only (tab 4)
+###################
+
+#remove incomplete scans
+imaging_df_dx2 <- imaging_df[(imaging_df$value=='complete'), ]
+
+#remove sex column
+imaging_df_dx2 <- subset(imaging_df_dx2, select = -sex)
+
+#remove all participants if incomplete cog data
+imaging_df_dx2 <- imaging_df_dx2[(imaging_df_dx2$cog_complete == 'YES'),]
+
+#remove cog_complete column - no longer necessary
+imaging_df_dx2 <- subset(imaging_df_dx2, select = -cog_complete)
+
+#aggregate data for plots
+imaging_df_dx2 <- ddply(imaging_df_dx2, .var = c("scanner_sites", "variable", 'group'), .fun = summarise,
+                  complete = sum(value %in% "complete"))
+
+#change variable name for consistency
+names(imaging_df_dx2)[2] <- "scan"
+
+#make a variable for sites
+imaging_df_dx2$site <- str_sub(imaging_df_dx2$scanner_sites,-3,-1)
+
+#set up fill colours for bargraphs
+imaging_df_dx2$FillColor <- ordered(paste0(imaging_df_dx2$scanner_sites, "_", imaging_df_dx2$group), levels=c(
+   "Toronto CMH_case", "Toronto CMH_control",
+   "Toronto CMP_case", "Toronto CMP_control",
+   "Maryland MRC_case", "Maryland MRC_control",
+   "Maryland MRP_case", "Maryland MRP_control",
+   "New York ZHH_case", "New York ZHH_control",
+   "New York ZHP_case", "New York ZHP_control"))
+
+```
+
+```{r plotting_df_sex, include = FALSE, warning = FALSE}
+
+###################
+#sex - all (tab 5)
+###################
+
+#remove incomplete scans
+imaging_df_sex1 <- imaging_df[(imaging_df$value=='complete'), ]
+
+#remove dx column
+imaging_df_sex1 <- subset(imaging_df_sex1, select = -group)
+
+#remove cog_complete column - we want even if not complete
+imaging_df_sex1 <- subset(imaging_df_sex1, select = -cog_complete)
+
+#aggregate data for plots
+imaging_df_sex1 <- ddply(imaging_df_sex1, .var = c("scanner_sites", "variable", 'sex'), .fun = summarise,
+                  complete = sum(value %in% "complete"))
+
+#change variable name for consistency
+names(imaging_df_sex1)[2] <- "scan"
+
+#make a variable for sites
+imaging_df_sex1$site <- str_sub(imaging_df_sex1$scanner_sites,-3,-1)
+
+#set up fill colours for bargraphs
+imaging_df_sex1$FillColor <- ordered(paste0(imaging_df_sex1$scanner_sites, "_", imaging_df_sex1$sex), levels=c(
+   "Toronto CMH_female", "Toronto CMH_male",
+   "Toronto CMP_female", "Toronto CMP_male",
+   "Maryland MRC_female", "Maryland MRC_male",
+   "Maryland MRP_female", "Maryland MRP_male",
+   "New York ZHH_female", "New York ZHH_male",
+   "New York ZHP_female", "New York ZHP_male"))
+
+#set up manual colour scale, with site colours and alpha
+colours_sex = c(
+  "Toronto CMH_female" = "#ccc591",
+  "Toronto CMH_male" = "#b3ccba",
+  "Toronto CMP_female" = "#ccc591",
+  "Toronto CMP_male" = "#b3ccba",
+  
+  "Maryland MRC_female" = "#ccc591",
+  "Maryland MRC_male" = "#b3ccba",
+  "Maryland MRP_female" = "#ccc591",
+  "Maryland MRP_male" = "#b3ccba",
+  
+  "New York ZHH_female" = "#ccc591",
+  "New York ZHH_male" = "#b3ccba",
+  "New York ZHP_female" = "#ccc591",
+  "New York ZHP_male" = "#b3ccba")
+
+###################
+#sex - complete only (tab 6)
+###################
+
+#remove incomplete scans
+imaging_df_sex2 <- imaging_df[(imaging_df$value=='complete'), ]
+
+#remove diagnosis column
+imaging_df_sex2 <- subset(imaging_df_sex2, select = -group)
+
+#remove all participants if incomplete cog data
+imaging_df_sex2 <- imaging_df_sex2[(imaging_df_sex2$cog_complete == 'YES'),]
+
+#remove cog_complete column - no longer necessary
+imaging_df_sex2 <- subset(imaging_df_sex2, select = -cog_complete)
+
+#aggregate data for plots
+imaging_df_sex2 <- ddply(imaging_df_sex2, .var = c("scanner_sites", "variable", 'sex'), .fun = summarise,
+                  complete = sum(value %in% "complete"))
+
+#change variable name for consistency
+names(imaging_df_sex2)[2] <- "scan"
+
+#make a variable for sites
+imaging_df_sex2$site <- str_sub(imaging_df_sex2$scanner_sites,-3,-1)
+
+#set up fill colours for bargraphs
+imaging_df_sex2$FillColor <- ordered(paste0(imaging_df_sex2$scanner_sites, "_", imaging_df_sex2$sex), levels=c(
+   "Toronto CMH_female", "Toronto CMH_male",
+   "Toronto CMP_female", "Toronto CMP_male",
+   "Maryland MRC_female", "Maryland MRC_male",
+   "Maryland MRP_female", "Maryland MRP_male",
+   "New York ZHH_female", "New York ZHH_male",
+   "New York ZHP_female", "New York ZHP_male"))
+
+```
+
+
+#SPINS: Counts of usable imaging data {.tabset}
+<br>
+
+These 6 tabbed plots show the counts of usable imaging data by acquisition type, where 'usable' includes data that passed QC from participants who continued to meet eligibility criteria throughout the study, and did not revoke consent to data sharing. Note that the ‘TOTAL’ facet does not include FLAIR scans in its count. 
+
+<br>
+<br>
+
+
+##MRI x site
+
+```{r plot_imaging_tab1, echo = FALSE, warning = FALSE, message = FALSE, fig.width= 15, fig.height= 9.5}
+
+#plot
+plot1 <- ggplot(imaging_df_site1, aes(x = scanner_sites)) +
+  facet_wrap(~scan, nrow = 1, labeller = as_labeller(scale_labels)) +
+  geom_bar(color = 'black', aes(weight = value, fill = FillColor)) +
+  geom_text(aes(x = scanner_sites, y= count_total, label=count_complete), vjust = -.5, size = 5) +
+  scale_fill_manual(
+    breaks=c("Toronto CMH_complete","Maryland MRC_complete", "New York ZHH_complete"),
+    labels=c('Toronto', 'Maryland', 'New York'),
+    values = colours_site1) +
+  scale_x_discrete(breaks=c('Toronto CMH', 'Toronto CMP', 'Maryland MRC', 'Maryland MRP', 'New York ZHH', 'New York ZHP'),
+        labels=c('CMH', 'CMP', 'MRC', 'MRP', 'ZHH', 'ZHP')) +
+  ylab("total count scanned") +
+  xlab("") +
+  ylim(-3,150) +
+  theme(axis.ticks = element_blank(),
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    text = element_text(size=16),
+    legend.position='top',
+    legend.title=element_blank(),
+    panel.background = element_rect(fill = '#f5f5f5'),
+    panel.grid.major.x = element_blank() ,
+    panel.grid.major.y = element_line(size=.5, color="white"),
+    panel.grid.minor.x = element_blank() ,
+    panel.grid.minor.y = element_line(size=.5, color="white"))
+
+plot1
+
+```
+
+> __Summary:__ We have `r sum(imaging_df_site1[imaging_df_site1$scan == 'TOTAL' & imaging_df_site1$variable == 'complete', 'count_complete'], na.rm = TRUE)` participants with complete imaging data (Toronto = `r sum(imaging_df_site1[imaging_df_site1$site %in% c('CMH', 'CMP') & imaging_df_site1$scan == 'TOTAL' & imaging_df_site1$variable == 'complete', 'count_complete'], na.rm = TRUE)`, Maryland = `r sum(imaging_df_site1[imaging_df_site1$site %in% c('MRC', 'MRP') & imaging_df_site1$scan == 'TOTAL' & imaging_df_site1$variable == 'complete', 'count_complete'], na.rm = TRUE)`, New York = `r sum(imaging_df_site1[imaging_df_site1$site %in% c('ZHH', 'ZHP') & imaging_df_site1$scan == 'TOTAL' & imaging_df_site1$variable == 'complete', 'count_complete'], na.rm = TRUE)`; including `r sum(imaging_df_site1[imaging_df_site1$site %in% c('CMP', 'MRP', 'ZHP') & imaging_df_site1$scan == 'TOTAL' & imaging_df_site1$variable == 'complete', 'count_complete'], na.rm = TRUE)` total on PRISMA).
+<br>
+
+__Note:__ Solid colours show complete scans. The value at the top of each bar indicates how many participants completed the given scan. Semi-transparency shows how many participants did not complete a given acquisition, for participants that completed at least one acquisition). 
+
+##MRI ~ cog x site
+
+```{r imaging_tab2, echo = FALSE, warning = FALSE, message = FALSE, fig.width= 15, fig.height= 9.5}
+
+#plot
+plot2 <- ggplot(imaging_df_site2, aes(x = scanner_sites)) +
+  facet_wrap(~scan, nrow = 1, labeller = as_labeller(scale_labels)) +
+  geom_bar(color = 'black', aes(weight = value, fill = FillColor)) +
+  geom_text(aes(x = scanner_sites, y= count_total, label=count_complete), vjust = -.5, size = 5) +
+  scale_fill_manual(
+    breaks=c("Toronto CMH_complete","Maryland MRC_complete", "New York ZHH_complete"),
+    labels=c('Toronto', 'Maryland', 'New York'),
+    values = colours_site2) +
+  scale_x_discrete(breaks=c('Toronto CMH', 'Toronto CMP', 'Maryland MRC', 'Maryland MRP', 'New York ZHH', 'New York ZHP'),
+        labels=c('CMH', 'CMP', 'MRC', 'MRP', 'ZHH', 'ZHP')) +
+  ylab("total count scanned") +
+  xlab("") +
+  ylim(-3,150) +
+  theme(axis.ticks = element_blank(),
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    text = element_text(size=16),
+    legend.position='top',
+    legend.title=element_blank(),
+    panel.background = element_rect(fill = '#f5f5f5'),
+    panel.grid.major.x = element_blank() ,
+    panel.grid.major.y = element_line(size=.5, color="white"),
+    panel.grid.minor.x = element_blank() ,
+    panel.grid.minor.y = element_line(size=.5, color="white"))
+
+plot2
+
+```
+
+> __Summary:__ We have `r sum(imaging_df_site2[imaging_df_site2$scan == 'TOTAL' & imaging_df_site2$variable == 'complete', 'count_complete'], na.rm = TRUE)` participants with complete imaging and cognitive data (Toronto = `r sum(imaging_df_site2[imaging_df_site2$site %in% c('CMH', 'CMP') & imaging_df_site2$scan == 'TOTAL' & imaging_df_site2$variable == 'complete', 'count_complete'], na.rm = TRUE)`, Maryland = `r sum(imaging_df_site2[imaging_df_site2$site %in% c('MRC', 'MRP') & imaging_df_site2$scan == 'TOTAL' & imaging_df_site2$variable == 'complete', 'count_complete'], na.rm = TRUE)`, New York = `r sum(imaging_df_site2[imaging_df_site2$site %in% c('ZHH', 'ZHP') & imaging_df_site2$scan == 'TOTAL' & imaging_df_site2$variable == 'complete', 'count_complete'], na.rm = TRUE)`; including `r sum(imaging_df_site2[imaging_df_site2$site %in% c('CMP', 'MRP', 'ZHP') & imaging_df_site2$scan == 'TOTAL' & imaging_df_site2$variable == 'complete', 'count_complete'], na.rm = TRUE)` total on PRISMA).
+<br>
+
+__Note:__ Solid colours show complete scans. The value at the top of each bar indicates how many participants completed the given scan. Semi-transparency shows how many participants did not complete a given acquisition, for participants that completed at least one acquisition). 
+
+
+##MRI x dx
+
+```{r imaging_dx_tab3, echo = FALSE, warning = FALSE, message = FALSE, fig.width= 15, fig.height= 9.5}
+
+#plot
+plot3 <- ggplot(imaging_df_dx1, aes(x = scanner_sites)) +
+  facet_wrap(~scan, nrow = 1, labeller = as_labeller(scale_labels)) +
+  geom_bar(color = 'black', aes(weight = complete, fill= FillColor)) + 
+  geom_text(color = 'black', aes(y = complete, fill= FillColor, label = complete), position = position_stack(), vjust = 1.5, size = 5) +
+  scale_x_discrete(breaks=c('Toronto CMH', 'Toronto CMP', 'Maryland MRC', 'Maryland MRP', 'New York ZHH', 'New York ZHP'),
+        labels=c('CMH', 'CMP', 'MRC', 'MRP', 'ZHH', 'ZHP'),
+        limits=c('Toronto CMH', 'Toronto CMP', 'Maryland MRC', 'Maryland MRP', 'New York ZHH', 'New York ZHP')) +
+  scale_fill_manual(
+    breaks=c("Toronto CMH_case","Toronto CMH_control"),
+    labels=c('SSD', 'HC'),
+    values = colours_dx) +
+  ylab("total count scanned") +
+  xlab("") +
+  ylim(-3,150) +
+  theme(axis.ticks = element_blank(),
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    text = element_text(size=16),
+    legend.position='top',
+    legend.title=element_blank(),
+    panel.background = element_rect(fill = '#f5f5f5'),
+    panel.grid.major.x = element_blank() ,
+    panel.grid.major.y = element_line(size=.5, color="white"),
+    panel.grid.minor.x = element_blank() ,
+    panel.grid.minor.y = element_line(size=.5, color="white"))
+
+plot3
+
+```
+
+> __Summary:__ We have `r sum(imaging_df_dx1[imaging_df_dx1$scan == 'TOTAL' & imaging_df_dx1$group== 'case', 'complete'], na.rm = TRUE)` SSD participants (Toronto = `r sum(imaging_df_dx1[imaging_df_dx1$site %in% c('CMH', 'CMP') & imaging_df_dx1$scan == 'TOTAL' & imaging_df_dx1$group== 'case', 'complete'], na.rm = TRUE)`, Maryland = `r sum(imaging_df_dx1[imaging_df_dx1$site %in% c('MRC', 'MRP') & imaging_df_dx1$scan == 'TOTAL' & imaging_df_dx1$group== 'case', 'complete'], na.rm = TRUE)`, New York = `r sum(imaging_df_dx1[imaging_df_dx1$site %in% c('ZHH', 'ZHP') & imaging_df_dx1$scan == 'TOTAL' & imaging_df_dx1$group== 'case', 'complete'], na.rm = TRUE)`; including `r sum(imaging_df_dx1[imaging_df_dx1$site %in% c('CMP', 'MRP', 'ZHP') & imaging_df_dx1$scan == 'TOTAL' & imaging_df_dx1$group== 'case', 'complete'], na.rm = TRUE)` total on PRISMA), and `r sum(imaging_df_dx1[imaging_df_dx1$scan == 'TOTAL' & imaging_df_dx1$group== 'control', 'complete'], na.rm = TRUE)` HC participants (Toronto = `r sum(imaging_df_dx1[imaging_df_dx1$site %in% c('CMH', 'CMP') & imaging_df_dx1$scan == 'TOTAL' & imaging_df_dx1$group== 'control', 'complete'], na.rm = TRUE)`, Maryland = `r sum(imaging_df_dx1[imaging_df_dx1$site %in% c('MRC', 'MRP') & imaging_df_dx1$scan == 'TOTAL' & imaging_df_dx1$group== 'control', 'complete'], na.rm = TRUE)`, New York = `r sum(imaging_df_dx1[imaging_df_dx1$site %in% c('ZHH', 'ZHP') & imaging_df_dx1$scan == 'TOTAL' & imaging_df_dx1$group== 'control', 'complete'], na.rm = TRUE)`; including `r sum(imaging_df_dx1[imaging_df_dx1$site %in% c('CMP', 'MRP', 'ZHP') & imaging_df_dx1$scan == 'TOTAL' & imaging_df_dx1$group== 'control', 'complete'], na.rm = TRUE)` total on PRISMA) with complete imaging data. 
+
+## MRI ~ cog x dx
+
+```{r imaging_dx_tab4, echo = FALSE, warning = FALSE, message = FALSE, fig.width= 15, fig.height= 9.5}
+
+#plot
+plot4 <- ggplot(imaging_df_dx2, aes(x = scanner_sites)) +
+  facet_wrap(~scan, nrow = 1, labeller = as_labeller(scale_labels)) +
+  geom_bar(color = 'black', aes(weight = complete, fill= FillColor)) +
+  geom_text(color = 'black', aes(y = complete, fill= FillColor, label = complete), position = position_stack(), vjust = 1.5, size = 5) +
+  scale_x_discrete(breaks=c('Toronto CMH', 'Toronto CMP', 'Maryland MRC', 'Maryland MRP', 'New York ZHH', 'New York ZHP'),
+        labels=c('CMH', 'CMP', 'MRC', 'MRP', 'ZHH', 'ZHP'),
+        limits=c('Toronto CMH', 'Toronto CMP', 'Maryland MRC', 'Maryland MRP', 'New York ZHH', 'New York ZHP')) +
+  scale_fill_manual(
+    breaks=c("Toronto CMH_case","Toronto CMH_control"),
+    labels=c('SSD', 'HC'),
+    values = colours_dx) +
+  ylab("total count scanned") +
+  xlab("") +
+  ylim(-3,150) +
+  theme(axis.ticks = element_blank(),
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    text = element_text(size=16),
+    legend.position='top',
+    legend.title=element_blank(),
+    panel.background = element_rect(fill = '#f5f5f5'),
+    panel.grid.major.x = element_blank() ,
+    panel.grid.major.y = element_line(size=.5, color="white"),
+    panel.grid.minor.x = element_blank() ,
+    panel.grid.minor.y = element_line(size=.5, color="white"))
+
+plot4
+
+```
+
+> __Summary:__ We have `r sum(imaging_df_dx2[imaging_df_dx2$scan == 'TOTAL' & imaging_df_dx2$group== 'case', 'complete'], na.rm = TRUE)` SSD participants (Toronto = `r sum(imaging_df_dx2[imaging_df_dx2$site %in% c('CMH', 'CMP') & imaging_df_dx2$scan == 'TOTAL' & imaging_df_dx2$group== 'case', 'complete'], na.rm = TRUE)`, Maryland = `r sum(imaging_df_dx2[imaging_df_dx2$site %in% c('MRC', 'MRP') & imaging_df_dx2$scan == 'TOTAL' & imaging_df_dx2$group== 'case', 'complete'], na.rm = TRUE)`, New York = `r sum(imaging_df_dx2[imaging_df_dx2$site %in% c('ZHH', 'ZHP') & imaging_df_dx2$scan == 'TOTAL' & imaging_df_dx2$group== 'case', 'complete'], na.rm = TRUE)`; including `r sum(imaging_df_dx2[imaging_df_dx2$site %in% c('CMP', 'MRP', 'ZHP') & imaging_df_dx2$scan == 'TOTAL' & imaging_df_dx2$group== 'case', 'complete'], na.rm = TRUE)` total on PRISMA), and `r sum(imaging_df_dx2[imaging_df_dx2$scan == 'TOTAL' & imaging_df_dx2$group== 'control', 'complete'], na.rm = TRUE)` HC participants (Toronto = `r sum(imaging_df_dx2[imaging_df_dx2$site %in% c('CMH', 'CMP') & imaging_df_dx2$scan == 'TOTAL' & imaging_df_dx2$group== 'control', 'complete'], na.rm = TRUE)`, Maryland = `r sum(imaging_df_dx2[imaging_df_dx2$site %in% c('MRC', 'MRP') & imaging_df_dx2$scan == 'TOTAL' & imaging_df_dx2$group== 'control', 'complete'], na.rm = TRUE)`, New York = `r sum(imaging_df_dx2[imaging_df_dx2$site %in% c('ZHH', 'ZHP') & imaging_df_dx2$scan == 'TOTAL' & imaging_df_dx2$group== 'control', 'complete'], na.rm = TRUE)`; including `r sum(imaging_df_dx2[imaging_df_dx2$site %in% c('CMP', 'MRP', 'ZHP') & imaging_df_dx2$scan == 'TOTAL' & imaging_df_dx2$group== 'control', 'complete'], na.rm = TRUE)` total on PRISMA) with complete imaging and cognitive data. 
+
+##MRI x sex
+
+```{r imaging_sex_tab5, echo = FALSE, warning = FALSE, message = FALSE, fig.width= 15, fig.height= 9.5}
+
+#plot
+plot5 <- ggplot(imaging_df_sex1, aes(x = scanner_sites)) +
+  facet_wrap(~scan, nrow = 1, labeller = as_labeller(scale_labels)) +
+  geom_bar(color = 'black', aes(weight = complete, fill= FillColor)) +
+  geom_text(color = 'black', aes(y = complete, fill= FillColor, label = complete), position = position_stack(), vjust = 1.5, size = 5) +
+  scale_x_discrete(breaks=c('Toronto CMH', 'Toronto CMP', 'Maryland MRC', 'Maryland MRP', 'New York ZHH', 'New York ZHP'),
+        labels=c('CMH', 'CMP', 'MRC', 'MRP', 'ZHH', 'ZHP'),
+        limits=c('Toronto CMH', 'Toronto CMP', 'Maryland MRC', 'Maryland MRP', 'New York ZHH', 'New York ZHP')) +
+  scale_fill_manual(
+    breaks=c("Toronto CMH_female","Toronto CMH_male"),
+    labels=c('female', 'male'),
+    values = colours_sex) +
+  ylab("total count scanned") +
+  xlab("") +
+  ylim(-3,150) +
+  theme(axis.ticks = element_blank(),
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    text = element_text(size=16),
+    legend.position='top',
+    legend.title=element_blank(),
+    panel.background = element_rect(fill = '#f5f5f5'),
+    panel.grid.major.x = element_blank() ,
+    panel.grid.major.y = element_line(size=.5, color="white"),
+    panel.grid.minor.x = element_blank() ,
+    panel.grid.minor.y = element_line(size=.5, color="white"))
+
+plot5
+
+```
+
+> __Summary:__ We have `r sum(imaging_df_sex1[imaging_df_sex1$scan == 'TOTAL' & imaging_df_sex1$sex== 'female', 'complete'], na.rm = TRUE)` female participants (Toronto = `r sum(imaging_df_sex1[imaging_df_sex1$site %in% c('CMH', 'CMP') & imaging_df_sex1$scan == 'TOTAL' & imaging_df_sex1$sex== 'female', 'complete'], na.rm = TRUE)`, Maryland = `r sum(imaging_df_sex1[imaging_df_sex1$site %in% c('MRC', 'MRP') & imaging_df_sex1$scan == 'TOTAL' & imaging_df_sex1$sex== 'female', 'complete'], na.rm = TRUE)`, New York = `r sum(imaging_df_sex1[imaging_df_sex1$site %in% c('ZHH', 'ZHP') & imaging_df_sex1$scan == 'TOTAL' & imaging_df_sex1$sex== 'female', 'complete'], na.rm = TRUE)`; including `r sum(imaging_df_sex1[imaging_df_sex1$site %in% c('CMP', 'MRP', 'ZHP') & imaging_df_sex1$scan == 'TOTAL' & imaging_df_sex1$sex== 'female', 'complete'], na.rm = TRUE)` total on PRISMA), and `r sum(imaging_df_sex1[imaging_df_sex1$scan == 'TOTAL' & imaging_df_sex1$sex== 'male', 'complete'], na.rm = TRUE)` male participants (Toronto = `r sum(imaging_df_sex1[imaging_df_sex1$site %in% c('CMH', 'CMP') & imaging_df_sex1$scan == 'TOTAL' & imaging_df_sex1$sex== 'male', 'complete'], na.rm = TRUE)`, Maryland = `r sum(imaging_df_sex1[imaging_df_sex1$site %in% c('MRC', 'MRP') & imaging_df_sex1$scan == 'TOTAL' & imaging_df_sex1$sex== 'male', 'complete'], na.rm = TRUE)`, New York = `r sum(imaging_df_sex1[imaging_df_sex1$site %in% c('ZHH', 'ZHP') & imaging_df_sex1$scan == 'TOTAL' & imaging_df_sex1$sex== 'male', 'complete'], na.rm = TRUE)`; including `r sum(imaging_df_sex1[imaging_df_sex1$site %in% c('CMP', 'MRP', 'ZHP') & imaging_df_sex1$scan == 'TOTAL' & imaging_df_sex1$sex== 'male', 'complete'], na.rm = TRUE)` total on PRISMA) with complete imaging data. 
+
+##MRI ~ cog x sex
+
+```{r imaging_sex_tab6, echo = FALSE, warning = FALSE, message = FALSE, fig.width= 15, fig.height= 9.5}
+
+#plot
+plot6 <- ggplot(imaging_df_sex2, aes(x = scanner_sites)) +
+  facet_wrap(~scan, nrow = 1, labeller = as_labeller(scale_labels)) +
+  geom_bar(color = 'black', aes(weight = complete, fill= FillColor)) +
+  geom_text(color = 'black', aes(y = complete, fill= FillColor, label = complete), position = position_stack(), vjust = 1.5, size = 5) +
+  scale_x_discrete(breaks=c('Toronto CMH', 'Toronto CMP', 'Maryland MRC', 'Maryland MRP', 'New York ZHH', 'New York ZHP'),
+        labels=c('CMH', 'CMP', 'MRC', 'MRP', 'ZHH', 'ZHP'),
+        limits=c('Toronto CMH', 'Toronto CMP', 'Maryland MRC', 'Maryland MRP', 'New York ZHH', 'New York ZHP')) +
+  scale_fill_manual(
+    breaks=c("Toronto CMH_female","Toronto CMH_male"),
+    labels=c('female', 'male'),
+    values = colours_sex) +
+  ylab("total count scanned") +
+  xlab("") +
+  ylim(-3,150) +
+  theme(axis.ticks = element_blank(),
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    text = element_text(size=16),
+    legend.position='top',
+    legend.title=element_blank(),
+    panel.background = element_rect(fill = '#f5f5f5'),
+    panel.grid.major.x = element_blank() ,
+    panel.grid.major.y = element_line(size=.5, color="white"),
+    panel.grid.minor.x = element_blank() ,
+    panel.grid.minor.y = element_line(size=.5, color="white"))
+
+plot6
+
+```
+
+> __Summary:__ We have `r sum(imaging_df_sex2[imaging_df_sex2$scan == 'TOTAL' & imaging_df_sex2$sex== 'female', 'complete'], na.rm = TRUE)` female participants (Toronto = `r sum(imaging_df_sex2[imaging_df_sex2$site %in% c('CMH', 'CMP') & imaging_df_sex2$scan == 'TOTAL' & imaging_df_sex2$sex== 'female', 'complete'], na.rm = TRUE)`, Maryland = `r sum(imaging_df_sex2[imaging_df_sex2$site %in% c('MRC', 'MRP') & imaging_df_sex2$scan == 'TOTAL' & imaging_df_sex2$sex== 'female', 'complete'], na.rm = TRUE)`, New York = `r sum(imaging_df_sex2[imaging_df_sex2$site %in% c('ZHH', 'ZHP') & imaging_df_sex2$scan == 'TOTAL' & imaging_df_sex2$sex== 'female', 'complete'], na.rm = TRUE)`; including `r sum(imaging_df_sex2[imaging_df_sex2$site %in% c('CMP', 'MRP', 'ZHP') & imaging_df_sex2$scan == 'TOTAL' & imaging_df_sex2$sex== 'female', 'complete'], na.rm = TRUE)` total on PRISMA), and `r sum(imaging_df_sex2[imaging_df_sex2$scan == 'TOTAL' & imaging_df_sex2$sex== 'male', 'complete'], na.rm = TRUE)` male participants (Toronto = `r sum(imaging_df_sex2[imaging_df_sex2$site %in% c('CMH', 'CMP') & imaging_df_sex2$scan == 'TOTAL' & imaging_df_sex2$sex== 'male', 'complete'], na.rm = TRUE)`, Maryland = `r sum(imaging_df_sex2[imaging_df_sex2$site %in% c('MRC', 'MRP') & imaging_df_sex2$scan == 'TOTAL' & imaging_df_sex2$sex== 'male', 'complete'], na.rm = TRUE)`, New York = `r sum(imaging_df_sex2[imaging_df_sex2$site %in% c('ZHH', 'ZHP') & imaging_df_sex2$scan == 'TOTAL' & imaging_df_sex2$sex== 'male', 'complete'], na.rm = TRUE)`; including `r sum(imaging_df_sex2[imaging_df_sex2$site %in% c('CMP', 'MRP', 'ZHP') & imaging_df_sex2$scan == 'TOTAL' & imaging_df_sex2$sex== 'male', 'complete'], na.rm = TRUE)` total on PRISMA) with complete imaging and cognitive data. 
